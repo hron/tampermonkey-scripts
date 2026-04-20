@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Perplexity keyboard shortcuts
 // @namespace    https://www.perplexity.ai/
-// @version      0.3.0
+// @version      0.4.0
 // @description  Adds navigation and scrolling shortcuts on perplexity.ai
 // @match        https://www.perplexity.ai/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=perplexity.ai
@@ -13,6 +13,7 @@
     "use strict";
 
     const LIBRARY_URL = "https://www.perplexity.ai/library";
+    const SPACES_URL = "https://www.perplexity.ai/spaces";
     const LINE_SCROLL_PX = 120;
     const PAGE_SCROLL_FACTOR = 0.9;
     const MESSAGE_ANCHOR_SELECTOR = ".group\\/query";
@@ -104,9 +105,9 @@
         anchors[targetIndex].scrollIntoView({ block: "start" });
     }
 
-    function openLibrary() {
-        if (location.href !== LIBRARY_URL) {
-            location.href = LIBRARY_URL;
+    function openUrl(url) {
+        if (location.href !== url) {
+            location.href = url;
         }
     }
 
@@ -122,7 +123,21 @@
             if (!event.repeat) {
                 event.preventDefault();
                 event.stopPropagation();
-                openLibrary();
+                openUrl(LIBRARY_URL);
+            }
+            return;
+        }
+
+        if (
+            event.ctrlKey &&
+            event.shiftKey &&
+            !event.altKey &&
+            (key === "s" || key === "S")
+        ) {
+            if (!event.repeat) {
+                event.preventDefault();
+                event.stopPropagation();
+                openUrl(SPACES_URL);
             }
             return;
         }
