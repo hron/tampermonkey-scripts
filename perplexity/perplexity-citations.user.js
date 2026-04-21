@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Perplexity citation fix for Vimium
 // @namespace    https://www.perplexity.ai/
-// @version      0.1.0
+// @version      0.3.0
 // @description  Make multi-source citations Vimium-accessible: adds tabindex so Vimium shows a hint, click to lock the popup open, press f again to follow any source link inside it.
 // @match        https://www.perplexity.ai/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=perplexity.ai
@@ -27,6 +27,12 @@
  *  4. Press f again → Vimium finds the <a> links inside the now-visible
  *     popup portal and shows hints for each source.
  *  5. Escape or click outside trigger/popup → unlock, popup closes.
+ *
+ * v0.3.0 fix: also block blur/focusout at document-capture so Vimium
+ * entering hint-mode (which steals focus from the trigger) no longer causes
+ * the popup to close before the user can follow a link.
+ * React 17+ uses the bubbling focusout event for onBlur delegation, so
+ * intercepting at document-capture fires before React's root handler.
  *
  * Visual feedback: a subtle ring is shown on the locked trigger via CSS
  * injected once at startup.
@@ -63,10 +69,11 @@
     function unlock() {
         if (!lockedTrigger) return;
         const trigger = lockedTrigger;
+        // Clear FIRST so our capture interceptors stop blocking events.
         lockedTrigger = null;
         trigger.removeAttribute('data-pplx-locked');
 
-        // Let leave events through again so Radix closes the popup.
+        // Let leave/blur events through again so Radix closes the popup.
         trigger.dispatchEvent(
             new PointerEvent('pointerout', { bubbles: true, cancelable: true, relatedTarget: document.body })
         );
@@ -88,9 +95,9 @@
 
         const opts = { bubbles: true, cancelable: true };
         trigger.dispatchEvent(new PointerEvent('pointerover', opts));
-        trigger.dispatchEvent(new PointerEvent('pointermove', opts));
-        trigger.dispatchEvent(new MouseEvent('mouseover', opts));
-        trigger.dispatchEvent(new MouseEvent('mousemove', opts));
+        trigger.dispatchEvent(new PointerEvent('pointermove',  opts));
+        trigger.dispatchEvent(new MouseEvent('mouseover',      opts));
+        trigger.dispatchEvent(new MouseEvent('mousemove',      opts));
     }
 
     // ── Document-level event interception ────────────────────────────────────
@@ -100,19 +107,34 @@
     // Calling stopImmediatePropagation() here prevents the event from ever
     // reaching React's root-container handler.
 
-    function isLeavingLockedTrigger(e) {
+    function isOnLockedTrigger(e) {
         return (
             lockedTrigger !== null &&
-            (e.target === lockedTrigger || lockedTrigger.contains(e.target)) &&
-            !lockedTrigger.contains(e.relatedTarget)
+            (e.target === lockedTrigger || lockedTrigger.contains(e.target))
         );
     }
 
+    function isLeavingLockedTrigger(e) {
+        return isOnLockedTrigger(e) && !lockedTrigger.contains(e.relatedTarget);
+    }
+
+    // Block pointer-leave events so hovering away doesn't close the popup.
     ['pointerout', 'mouseout'].forEach(type => {
         document.addEventListener(type, e => {
             if (isLeavingLockedTrigger(e)) {
                 e.stopImmediatePropagation();
                 e.preventDefault();
+            }
+        }, { capture: true });
+    });
+
+    // Block blur/focusout so Vimium stealing focus doesn't close the popup.
+    // blur is not cancelable, so only stopImmediatePropagation is used.
+    // focusout bubbles and is what React 17+ uses for onBlur delegation.
+    ['blur', 'focusout'].forEach(type => {
+        document.addEventListener(type, e => {
+            if (isOnLockedTrigger(e)) {
+                e.stopImmediatePropagation();
             }
         }, { capture: true });
     });
@@ -127,15 +149,9 @@
         if (!lockedTrigger) return;
         if (lockedTrigger.contains(e.target)) return;
 
-        // Allow clicks inside an open Radix popup portal (data-state="open" root)
-        const openPopupEl = document.querySelector(
-            '[data-radix-popper-content-wrapper] [data-state="open"], ' +
-            '[data-state="open"][role="tooltip"], ' +
-            '[data-state="open"][role="dialog"]'
-        );
-        if (openPopupEl && openPopupEl.closest('[data-radix-popper-content-wrapper]')?.contains(e.target)) {
-            return;
-        }
+        // Allow clicks inside an open Radix popup portal
+        const wrapper = e.target.closest('[data-radix-popper-content-wrapper]');
+        if (wrapper) return;
 
         unlock();
     }, { capture: true });
@@ -191,12 +207,12 @@
 
     const style = document.createElement('style');
     style.textContent = `
-    /* Subtle Vimium-hint-friendly ring when a multi-citation is click-locked */
-    span[data-pplx-locked] {
-      outline: 2px solid oklch(var(--super-color, 65% 0.22 290)) !important;
-      outline-offset: 1px;
-      border-radius: 3px;
-    }
-  `;
+        /* Subtle ring when a multi-citation is click-locked open */
+        span[data-pplx-locked] {
+            outline: 2px solid oklch(var(--super-color, 65% 0.22 290)) !important;
+            outline-offset: 1px;
+            border-radius: 3px;
+        }
+    `;
     document.head.appendChild(style);
 })();
