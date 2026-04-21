@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Perplexity citation fix for Vimium
 // @namespace    https://www.perplexity.ai/
-// @version      0.3.0
+// @version      0.4.0
 // @description  Make multi-source citations Vimium-accessible: adds tabindex so Vimium shows a hint, click to lock the popup open, press f again to follow any source link inside it.
 // @match        https://www.perplexity.ai/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=perplexity.ai
@@ -21,18 +21,13 @@
  *     multi-source citation.
  *  2. Click (Vimium hint activation) → dispatch hover events to open the
  *     Radix popup, then "lock" it open.
- *  3. While locked, block pointerout/mouseout at document-capture phase.
- *     This runs BEFORE React 17+'s root-container delegation, so React
- *     never sees the leave events and the popup stays open.
+ *  3. While locked, a MutationObserver watches data-state on the trigger.
+ *     Whenever Radix closes the popup (for ANY reason – blur, Vimium hint
+ *     mode stealing focus, DismissableLayer firing, etc.) the observer
+ *     immediately reopens it via requestAnimationFrame.
  *  4. Press f again → Vimium finds the <a> links inside the now-visible
  *     popup portal and shows hints for each source.
- *  5. Escape or click outside trigger/popup → unlock, popup closes.
- *
- * v0.3.0 fix: also block blur/focusout at document-capture so Vimium
- * entering hint-mode (which steals focus from the trigger) no longer causes
- * the popup to close before the user can follow a link.
- * React 17+ uses the bubbling focusout event for onBlur delegation, so
- * intercepting at document-capture fires before React's root handler.
+ *  5. Escape or click outside trigger/popup → unlock, popup closes for real.
  *
  * Visual feedback: a subtle ring is shown on the locked trigger via CSS
  * injected once at startup.
@@ -59,21 +54,52 @@
     /** The currently "click-locked" trigger whose popup we keep open. */
     let lockedTrigger = null;
 
+    /**
+     * MutationObserver that watches data-state on the locked trigger.
+     * If Radix closes the popup for ANY reason while locked, we reopen it.
+     */
+    let stateWatcher = null;
+
+    function startStateWatcher(trigger) {
+        stopStateWatcher();
+        stateWatcher = new MutationObserver(() => {
+            // If the popup was closed while we want it locked open, reopen it.
+            if (lockedTrigger === trigger &&
+                trigger.getAttribute('data-state') === 'closed') {
+                // rAF gives React one frame to finish its state update before
+                // we dispatch new events, avoiding a synchronous re-entrancy.
+                requestAnimationFrame(() => {
+                    if (lockedTrigger === trigger) openPopup(trigger);
+                });
+            }
+        });
+        stateWatcher.observe(trigger, { attributes: true, attributeFilter: ['data-state'] });
+    }
+
+    function stopStateWatcher() {
+        if (stateWatcher) {
+            stateWatcher.disconnect();
+            stateWatcher = null;
+        }
+    }
+
     function lock(trigger) {
         if (lockedTrigger === trigger) return;
         if (lockedTrigger) unlock();
         lockedTrigger = trigger;
         trigger.setAttribute('data-pplx-locked', '');
+        startStateWatcher(trigger);
     }
 
     function unlock() {
         if (!lockedTrigger) return;
+        // Stop the watcher FIRST so the reopen logic doesn't fight our close.
+        stopStateWatcher();
         const trigger = lockedTrigger;
-        // Clear FIRST so our capture interceptors stop blocking events.
         lockedTrigger = null;
         trigger.removeAttribute('data-pplx-locked');
 
-        // Let leave/blur events through again so Radix closes the popup.
+        // Let leave events through so Radix closes the popup.
         trigger.dispatchEvent(
             new PointerEvent('pointerout', { bubbles: true, cancelable: true, relatedTarget: document.body })
         );
@@ -102,39 +128,24 @@
 
     // ── Document-level event interception ────────────────────────────────────
     //
-    // React 17+ delegates events to the root container, NOT document. So our
-    // document-capture listeners fire BEFORE React can process them.
-    // Calling stopImmediatePropagation() here prevents the event from ever
-    // reaching React's root-container handler.
+    // Still block pointer-leave events as a first-line defence: keeps the
+    // popup open when the physical mouse cursor drifts off the trigger.
+    // React 17+ delegates to the root container (not document), so our
+    // document-capture listener fires first.
 
-    function isOnLockedTrigger(e) {
+    function isLeavingLockedTrigger(e) {
         return (
             lockedTrigger !== null &&
-            (e.target === lockedTrigger || lockedTrigger.contains(e.target))
+            (e.target === lockedTrigger || lockedTrigger.contains(e.target)) &&
+            !lockedTrigger.contains(e.relatedTarget)
         );
     }
 
-    function isLeavingLockedTrigger(e) {
-        return isOnLockedTrigger(e) && !lockedTrigger.contains(e.relatedTarget);
-    }
-
-    // Block pointer-leave events so hovering away doesn't close the popup.
     ['pointerout', 'mouseout'].forEach(type => {
         document.addEventListener(type, e => {
             if (isLeavingLockedTrigger(e)) {
                 e.stopImmediatePropagation();
                 e.preventDefault();
-            }
-        }, { capture: true });
-    });
-
-    // Block blur/focusout so Vimium stealing focus doesn't close the popup.
-    // blur is not cancelable, so only stopImmediatePropagation is used.
-    // focusout bubbles and is what React 17+ uses for onBlur delegation.
-    ['blur', 'focusout'].forEach(type => {
-        document.addEventListener(type, e => {
-            if (isOnLockedTrigger(e)) {
-                e.stopImmediatePropagation();
             }
         }, { capture: true });
     });
@@ -150,8 +161,7 @@
         if (lockedTrigger.contains(e.target)) return;
 
         // Allow clicks inside an open Radix popup portal
-        const wrapper = e.target.closest('[data-radix-popper-content-wrapper]');
-        if (wrapper) return;
+        if (e.target.closest('[data-radix-popper-content-wrapper]')) return;
 
         unlock();
     }, { capture: true });
