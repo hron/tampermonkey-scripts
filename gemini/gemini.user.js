@@ -1,122 +1,327 @@
 // ==UserScript==
 // @name         Gemini keyboard shortcuts
 // @namespace    https://gemini.google.com/
-// @version      0.1.0
-// @description  Adds navigation and scrolling shortcuts on gemini.google.com, mirroring the Perplexity shortcuts
+// @version      0.3.0
+// @description  Keyboard shortcuts for Gemini: search/new chat/input/model/tools/plus + scrolling navigation
 // @match        https://gemini.google.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=gemini.google.com
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
 
-/**
- * Shortcut map (same as the Perplexity script)
- * ─────────────────────────────────────────────
- * Ctrl+Alt+ArrowUp        scroll up one "line"  (120 px)
- * Ctrl+Alt+ArrowDown      scroll down one "line"
- * Ctrl+Alt+PageUp         scroll up one page    (90 % of viewport)
- * Ctrl+Alt+PageDown       scroll down one page
- * Ctrl+Alt+Home           scroll to very top
- * Ctrl+Alt+End            scroll to very bottom
- * Ctrl+Alt+Shift+ArrowUp  jump to previous conversation turn
- * Ctrl+Alt+Shift+ArrowDown jump to next conversation turn
- * Escape / Alt+i          focus the scroll container (blur the input)
- *
- * Gemini DOM notes
- * ────────────────
- * Gemini is an Angular SPA. The relevant elements are Angular custom elements
- * (tag names, not class names):
- *
- *   Scroll container  – <chat-window>  (contains <infinite-scroller> inside;
- *                        we scroll the first overflow-y:auto/scroll ancestor
- *                        of the message list, discovered at runtime)
- *   Conversation turns – <user-query> and <model-response>
- *   Input             – div[contenteditable] inside <rich-textarea>
- *
- * Because Angular renders asynchronously, selectors are resolved lazily on
- * every key event rather than cached at startup.
- */
-
 (function () {
     'use strict';
 
+    const GEMINI_ORIGIN = 'https://gemini.google.com';
+    const SEARCH_PATH = '/search';
+    const NEW_CHAT_PATH = '/app';
+
     const LINE_SCROLL_PX = 120;
     const PAGE_SCROLL_FACTOR = 0.9;
-
-    // Selectors for the two sides of a conversation turn.
-    // Both are Angular custom-element tag names that appear in the DOM.
     const MESSAGE_SELECTORS = ['user-query', 'model-response'];
 
-    // ── Scroll container ──────────────────────────────────────────────────────
+    function normalizeKey(key) {
+        if (key === 'Up') return 'ArrowUp';
+        if (key === 'Down') return 'ArrowDown';
+        return key;
+    }
 
-    /**
-     * Gemini renders its chat inside <chat-window> → <infinite-scroller>.
-     * The actual scrollable element is whichever ancestor has overflow-y
-     * set to auto or scroll.  We walk up from a known inner element to find
-     * it so the script survives minor DOM refactors.
-     */
-    function getScrollableContainer() {
-        // // Prefer the explicit chat-window element.
-        // const chatWindow = document.querySelector('chat-window');
-        // if (chatWindow) {
-        //     // Walk up to find the actual scrolling ancestor.
-        //     const scroller = findScrollableAncestorOrSelf(chatWindow);
-        //     if (scroller) return scroller;
-        // }
+    function isVisible(el) {
+        if (!(el instanceof HTMLElement)) return false;
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        const style = window.getComputedStyle(el);
+        if (style.visibility === 'hidden' || style.display === 'none') return false;
+        return true;
+    }
 
-        // // Fallback: find via infinite-scroller (older Gemini builds).
-        // const infiniteScroller = document.querySelector('infinite-scroller');
-        // if (infiniteScroller) {
-        //     const scroller = findScrollableAncestorOrSelf(infiniteScroller);
-        //     if (scroller) return scroller;
-        // }
+    function isEditable(el) {
+        if (!(el instanceof HTMLElement)) return false;
+        const tag = el.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA') return true;
+        if (el.isContentEditable) return true;
+        
+        // Handle Gemini's specific rich-text editor div structure where the parent might have contenteditable
+        if (el.classList && el.classList.contains('ql-editor')) return true;
+        
+        return false;
+    }
 
-        // // Last resort: the Angular Material sidenav content area.
-        // return document.querySelector('mat-sidenav-content') || document.documentElement;
-        return document.querySelector('model-response');
+    function isTyping() {
+        return isEditable(document.activeElement);
+    }
+
+    function getElementName(el) {
+        if (!(el instanceof HTMLElement)) return '';
+        const parts = [
+            el.getAttribute('aria-label') || '',
+            el.getAttribute('title') || '',
+            el.getAttribute('data-tooltip') || '',
+            el.textContent || '',
+        ];
+
+        return parts
+            .join(' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+    }
+
+    function queryVisible(selector, scope = document) {
+        return Array.from(scope.querySelectorAll(selector)).filter(isVisible);
+    }
+
+    function clickElement(el) {
+        if (!(el instanceof HTMLElement)) return false;
+        el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+        el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+        el.click();
+        return true;
+    }
+
+    function matchesPatterns(text, patterns) {
+        return patterns.some((pattern) => {
+            if (typeof pattern === 'string') return text.includes(pattern.toLowerCase());
+            return pattern.test(text);
+        });
+    }
+
+    function getComposerInput() {
+        const selectors = [
+            'rich-textarea [contenteditable="true"]',
+            '[contenteditable="true"][role="textbox"]',
+            'textarea[aria-label*="message" i]',
+            '[contenteditable="true"][aria-label*="message" i]',
+            '[contenteditable="true"][aria-label*="prompt" i]',
+            'textarea',
+            '[contenteditable="true"]',
+        ];
+
+        const candidates = [];
+        for (const selector of selectors) {
+            for (const el of queryVisible(selector)) {
+                if (!isEditable(el)) continue;
+                if (isSearchInput(el)) continue;
+                candidates.push(el);
+            }
+            if (candidates.length) break;
+        }
+
+        if (!candidates.length) return null;
+
+        candidates.sort((a, b) => {
+            const ar = a.getBoundingClientRect();
+            const br = b.getBoundingClientRect();
+            return br.bottom - ar.bottom;
+        });
+
+        return candidates[0];
+    }
+
+    function focusCaretAtEnd(el) {
+        if (!(el instanceof HTMLElement)) return;
+        el.focus({ preventScroll: true });
+
+        if (el.isContentEditable) {
+            const selection = window.getSelection();
+            if (!selection) return;
+            const range = document.createRange();
+            range.selectNodeContents(el);
+            range.collapse(false);
+            selection.removeAllRanges();
+            selection.addRange(range);
+        }
+    }
+
+    function focusComposerInput() {
+        const maxAttempts = 12;
+        let attempts = 0;
+
+        const tryFocus = () => {
+            attempts += 1;
+            const input = getComposerInput();
+            if (input) {
+                focusCaretAtEnd(input);
+                return;
+            }
+            if (attempts < maxAttempts) setTimeout(tryFocus, 120);
+        };
+
+        tryFocus();
+    }
+
+    function isSearchInput(el) {
+        if (!(el instanceof HTMLElement)) return false;
+        if (!isEditable(el)) return false;
+
+        const label = getElementName(el);
+        if (label.includes('search')) return true;
+
+        const placeholder = (el.getAttribute('placeholder') || '').toLowerCase();
+        if (placeholder.includes('search')) return true;
+
+        if (el.getAttribute('type') === 'search') return true;
+        return false;
+    }
+
+    function getSearchInput() {
+        const selectors = [
+            '[role="dialog"] input[type="search"]',
+            '[role="dialog"] input[aria-label*="search" i]',
+            '[role="dialog"] input[placeholder*="search" i]',
+            'input[type="search"]',
+            'input[aria-label*="search" i]',
+            'input[placeholder*="search" i]',
+            'textarea[aria-label*="search" i]',
+        ];
+
+        for (const selector of selectors) {
+            const element = queryVisible(selector)[0];
+            if (element) return element;
+        }
+
+        return null;
+    }
+
+    function focusSearchInputWhenReady() {
+        const maxAttempts = 20;
+        let attempts = 0;
+
+        const tryFocus = () => {
+            attempts += 1;
+            const input = getSearchInput();
+            if (input) {
+                input.focus({ preventScroll: true });
+                if (typeof input.select === 'function') input.select();
+                return;
+            }
+            if (attempts < maxAttempts) setTimeout(tryFocus, 120);
+        };
+
+        tryFocus();
+    }
+
+    function getSearchScope() {
+        const dialogs = queryVisible('[role="dialog"]');
+        for (const dialog of dialogs) {
+            const input = dialog.querySelector('input[type="search"], input[aria-label*="search" i], input[placeholder*="search" i]');
+            if (input && isVisible(input)) return dialog;
+            if (getElementName(dialog).includes('search chats')) return dialog;
+        }
+
+        if (location.pathname.startsWith(SEARCH_PATH)) return document;
+        return null;
+    }
+
+    function isSearchContextActive() {
+        return !!getSearchScope();
+    }
+
+    function isScrollableElement(el) {
+        if (!(el instanceof HTMLElement)) return false;
+        const style = window.getComputedStyle(el);
+        const overflowY = style.overflowY;
+        const canScroll = el.scrollHeight > el.clientHeight + 4;
+        return canScroll && (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay');
     }
 
     function findScrollableAncestorOrSelf(el) {
         let node = el;
         while (node && node !== document.documentElement) {
-            const style = window.getComputedStyle(node);
-            const overflow = style.overflowY;
-            if ((overflow === 'auto' || overflow === 'scroll') && node.scrollHeight > node.clientHeight) {
-                return node;
-            }
+            if (isScrollableElement(node)) return node;
             node = node.parentElement;
         }
-        // If nothing found, return el itself (best effort).
-        return el;
+        return null;
     }
 
-    // ── Scroll actions ────────────────────────────────────────────────────────
+    function getScrollableContainer() {
+        const candidates = [];
+
+        const addCandidate = (el) => {
+            if (!(el instanceof HTMLElement)) return;
+            if (!candidates.includes(el)) candidates.push(el);
+            const ancestor = findScrollableAncestorOrSelf(el);
+            if (ancestor && !candidates.includes(ancestor)) candidates.push(ancestor);
+        };
+
+        const selectors = [
+            'infinite-scroller.chat-history',
+            'chat-window infinite-scroller',
+            'infinite-scroller',
+            'chat-window',
+            'mat-sidenav-content',
+            'main',
+        ];
+
+        for (const selector of selectors) {
+            for (const el of document.querySelectorAll(selector)) {
+                addCandidate(el);
+            }
+        }
+
+        const messageAnchor = document.querySelector('model-response, user-query, message-content, structured-content-container');
+        if (messageAnchor) addCandidate(messageAnchor);
+
+        const bestScrollable = candidates
+            .filter(isScrollableElement)
+            .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0];
+
+        if (bestScrollable) return bestScrollable;
+
+        const pageScroller = document.scrollingElement;
+        if (pageScroller instanceof HTMLElement && pageScroller.scrollHeight > pageScroller.clientHeight + 4) {
+            return pageScroller;
+        }
+
+        return candidates[0] || document.documentElement;
+    }
+
+    function scrollTargetBy(container, deltaY) {
+        if (container instanceof HTMLElement) {
+            container.scrollBy({ top: deltaY, behavior: 'auto' });
+            return;
+        }
+
+        window.scrollBy({ top: deltaY, behavior: 'auto' });
+    }
+
+    function scrollTargetTo(container, targetY) {
+        if (container instanceof HTMLElement) {
+            container.scrollTo({ top: targetY, behavior: 'auto' });
+            return;
+        }
+
+        window.scrollTo({ top: targetY, behavior: 'auto' });
+    }
 
     function scrollByLines(direction) {
-        getScrollableContainer().scrollBy({ top: LINE_SCROLL_PX * direction });
+        scrollTargetBy(getScrollableContainer(), LINE_SCROLL_PX * direction);
     }
 
     function scrollByPage(direction) {
-        const container = getScrollableContainer();
         const amount = Math.max(200, Math.floor(window.innerHeight * PAGE_SCROLL_FACTOR)) * direction;
-        container.scrollBy({ top: amount, behavior: 'auto' });
+        scrollTargetBy(getScrollableContainer(), amount);
     }
 
     function scrollToTop() {
-        getScrollableContainer().scrollTo({ top: 0 });
+        scrollTargetTo(getScrollableContainer(), 0);
     }
 
     function scrollToBottom() {
         const container = getScrollableContainer();
-        container.scrollTo({ top: container.scrollHeight });
-    }
+        if (container instanceof HTMLElement) {
+            scrollTargetTo(container, container.scrollHeight);
+            return;
+        }
 
-    // ── Message-jump ──────────────────────────────────────────────────────────
+        scrollTargetTo(container, document.documentElement.scrollHeight || document.body.scrollHeight || 0);
+    }
 
     function getMessageAnchors() {
         const selector = MESSAGE_SELECTORS.join(', ');
         return Array.from(document.querySelectorAll(selector))
-            .filter(el => {
+            .filter(el => el instanceof HTMLElement)
+            .filter((el) => {
                 const rect = el.getBoundingClientRect();
                 return rect.height > 10 && rect.width > 10;
             });
@@ -126,7 +331,14 @@
         const anchors = getMessageAnchors();
         if (!anchors.length) return;
 
-        const focusLine = window.innerHeight * 0.25;
+        const scroller = getScrollableContainer();
+        const scrollerRect = (scroller instanceof HTMLElement && scroller !== document.documentElement && scroller !== document.body) 
+            ? scroller.getBoundingClientRect() 
+            : { top: 0, height: window.innerHeight };
+        
+        // Use a focus line near the top of the scroller
+        const focusLine = scrollerRect.top + (scrollerRect.height * 0.1);
+
         let currentIndex = 0;
         let bestDistance = Infinity;
 
@@ -144,14 +356,14 @@
         if (direction > 0) {
             while (
                 targetIndex < anchors.length &&
-                anchors[targetIndex].getBoundingClientRect().top <= focusLine + 4
+                (anchors[targetIndex].getBoundingClientRect().top - scrollerRect.top) <= 10
             ) {
                 targetIndex++;
             }
         } else {
             while (
                 targetIndex >= 0 &&
-                anchors[targetIndex].getBoundingClientRect().top >= focusLine - 4
+                (anchors[targetIndex].getBoundingClientRect().top - scrollerRect.top) >= -10
             ) {
                 targetIndex--;
             }
@@ -160,77 +372,339 @@
         targetIndex = Math.max(0, Math.min(anchors.length - 1, targetIndex));
         if (targetIndex === currentIndex) return;
 
-        anchors[targetIndex].scrollIntoView({ block: 'start' });
+        const targetEl = anchors[targetIndex];
+
+        if (scroller instanceof HTMLElement && scroller !== document.documentElement && scroller !== document.body) {
+            const elRect = targetEl.getBoundingClientRect();
+            // Scroll so the element's top is near the top of the scroller
+            const offset = elRect.top - scrollerRect.top + scroller.scrollTop - 20;
+            scroller.scrollTo({ top: offset, behavior: 'auto' });
+        } else {
+            targetEl.scrollIntoView({ block: 'start' });
+        }
     }
 
-    // ── Focus helpers ─────────────────────────────────────────────────────────
+    function focusScrollableContainer() {
+        const container = getScrollableContainer();
+        if (container instanceof HTMLElement) {
+            // Focus the container so native keys work
+            if (!container.hasAttribute('tabindex')) {
+                container.setAttribute('tabindex', '-1');
+            }
+            container.focus({ preventScroll: true });
+            
+            // Also explicitly blur active element if it's an input
+            const active = document.activeElement;
+            if (active instanceof HTMLElement && isEditable(active)) {
+                active.blur();
+            }
+            return true;
+        }
 
-    /**
-     * Returns true if the active element is an editable field where we must
-     * NOT steal keypresses (user is typing a message).
-     */
-    function isTyping() {
-        const el = document.activeElement;
-        if (!el) return false;
-        const tag = el.tagName;
-        if (tag === 'INPUT' || tag === 'TEXTAREA') return true;
-        if (el.isContentEditable) return true;
+
+        if (document.body instanceof HTMLElement) {
+            document.body.focus({ preventScroll: true });
+            return true;
+        }
+
         return false;
     }
 
-    function blurToContainer() {
-        getScrollableContainer().focus();
+    function blurToScrollableContainer() {
+        const active = document.activeElement;
+        if (active instanceof HTMLElement && isEditable(active)) {
+            active.blur();
+        }
+
+        focusScrollableContainer();
     }
 
-    // ── Key handler ───────────────────────────────────────────────────────────
+    function getClickableCandidates(scope = document) {
+        return queryVisible(
+            'button, [role="button"], a[href], a[role="button"], [tabindex]:not([tabindex="-1"])',
+            scope,
+        ).filter((el) => {
+            if (el.getAttribute('disabled') != null) return false;
+            if (el.getAttribute('aria-disabled') === 'true') return false;
+            return true;
+        });
+    }
 
-    function normalizeKey(key) {
-        if (key === 'Up') return 'ArrowUp';
-        if (key === 'Down') return 'ArrowDown';
-        return key;
+    function findBestMatch({ selectors, patterns, scopes, preferBottom = false, preferRight = false, preferLeft = false }) {
+        for (const scope of scopes) {
+            if (!scope) continue;
+            for (const selector of selectors) {
+                const match = queryVisible(selector, scope)[0];
+                if (match) return match;
+            }
+        }
+
+        let best = null;
+        let bestScore = -Infinity;
+
+        for (const scope of scopes) {
+            if (!scope) continue;
+            for (const el of getClickableCandidates(scope)) {
+                const name = getElementName(el);
+                if (!name) continue;
+                if (!matchesPatterns(name, patterns)) continue;
+
+                const rect = el.getBoundingClientRect();
+                let score = 50;
+
+                if (preferBottom) score += rect.top > window.innerHeight * 0.58 ? 8 : -4;
+                if (preferRight) score += rect.left > window.innerWidth * 0.55 ? 6 : -2;
+                if (preferLeft) score += rect.right < window.innerWidth * 0.45 ? 6 : -2;
+
+                if (scope !== document) score += 2;
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = el;
+                }
+            }
+        }
+
+        return best;
+    }
+
+    function getComposerScope() {
+        const input = getComposerInput();
+        if (!input) return null;
+        return input.closest('form') || input.closest('footer') || input.parentElement || null;
+    }
+
+    function dispatchGeminiShortcut(letter) {
+        const key = letter.toLowerCase();
+        const code = `Key${letter.toUpperCase()}`;
+        const target = document.activeElement || document.body || document.documentElement;
+
+        const eventInit = {
+            key,
+            code,
+            ctrlKey: true,
+            shiftKey: true,
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+        };
+
+        target.dispatchEvent(new KeyboardEvent('keydown', eventInit));
+        target.dispatchEvent(new KeyboardEvent('keyup', eventInit));
+    }
+
+    function openSearchChats() {
+        if (isSearchContextActive()) {
+            focusSearchInputWhenReady();
+            return;
+        }
+
+        dispatchGeminiShortcut('k'); // Gemini native: Ctrl+Shift+K
+
+        setTimeout(() => {
+            if (isSearchContextActive()) {
+                focusSearchInputWhenReady();
+                return;
+            }
+            location.assign(new URL(SEARCH_PATH, GEMINI_ORIGIN).toString());
+        }, 220);
+    }
+
+    function clickNewChatButton() {
+        const target = findBestMatch({
+            selectors: [
+                'button[aria-label*="New chat" i]',
+                'button[title*="New chat" i]',
+                'a[href="/app"]',
+            ],
+            patterns: [/new chat/i, /new conversation/i],
+            scopes: [document],
+        });
+
+        if (!target) return false;
+        return clickElement(target);
+    }
+
+    function openNewChat() {
+        if (clickNewChatButton()) return;
+
+        dispatchGeminiShortcut('o'); // Gemini native: Ctrl+Shift+O
+
+        setTimeout(() => {
+            if (location.pathname.startsWith(SEARCH_PATH)) {
+                location.assign(new URL(NEW_CHAT_PATH, GEMINI_ORIGIN).toString());
+            }
+        }, 220);
+    }
+
+    function openModelPicker() {
+        const composerScope = getComposerScope();
+
+        const target = findBestMatch({
+            selectors: [
+                '[aria-label*="Open mode picker" i]',
+                '[title*="Open mode picker" i]',
+                '[aria-label*="Model" i]',
+                '[title*="Model" i]',
+                '[aria-haspopup="menu"][aria-label*="Gemini" i]',
+            ],
+            patterns: [/mode picker/i, /model/i, /gemini\s*\d/i, /flash/i, /pro/i, /thinking/i],
+            scopes: [composerScope, document],
+            preferBottom: true,
+            preferRight: true,
+        });
+
+        if (target) clickElement(target);
+    }
+
+    function openToolsMenu() {
+        const composerScope = getComposerScope();
+
+        const target = findBestMatch({
+            selectors: [
+                '[aria-label*="Tools" i]',
+                '[title*="Tools" i]',
+            ],
+            patterns: [/tools?/i],
+            scopes: [composerScope, document],
+            preferBottom: true,
+            preferRight: true,
+        });
+
+        if (target) clickElement(target);
+    }
+
+    function openPlusMenu() {
+        const composerScope = getComposerScope();
+
+        const target = findBestMatch({
+            selectors: [
+                '[aria-label*="Plus" i]',
+                '[aria-label*="Add" i]',
+                '[aria-label*="Attach" i]',
+                '[title*="Add" i]',
+                '[title*="Attach" i]',
+            ],
+            patterns: [/^\+$/i, /\bplus\b/i, /\badd\b/i, /attach/i, /upload/i],
+            scopes: [composerScope, document],
+            preferBottom: true,
+            preferLeft: true,
+        });
+
+        if (target) clickElement(target);
     }
 
     function handleKeydown(event) {
         const key = normalizeKey(event.key);
+        const lowerKey = key.toLowerCase();
 
-        // Escape / Alt+i → blur input, focus scroll container.
-        if (
-            (key === 'Escape' && !event.ctrlKey && !event.altKey && !event.shiftKey) ||
-            (key === 'i' && !event.ctrlKey && event.altKey && !event.shiftKey)
-        ) {
-            blurToContainer();
-            return;
-        }
-
-        // All remaining shortcuts require Ctrl+Alt.
-        if (!event.ctrlKey || !event.altKey) return;
-
-        // Don't fire if the user is currently typing, except for the
-        // Escape/Alt+i branch handled above.
-        if (isTyping()) return;
-
-        const preventDefault = () => {
+        const prevent = () => {
             event.preventDefault();
             event.stopPropagation();
         };
 
-        if (!event.shiftKey) {
-            switch (key) {
-                case 'ArrowUp': preventDefault(); scrollByLines(-1); return;
-                case 'ArrowDown': preventDefault(); scrollByLines(1); return;
-                case 'PageUp': preventDefault(); scrollByPage(-1); return;
-                case 'PageDown': preventDefault(); scrollByPage(1); return;
-                case 'Home': preventDefault(); scrollToTop(); return;
-                case 'End': preventDefault(); scrollToBottom(); return;
+        // Ctrl+Shift+H => open Search chats (delegates to Gemini's Ctrl+Shift+K + fallback /search).
+        if (event.ctrlKey && event.shiftKey && !event.altKey && !event.metaKey && lowerKey === 'h') {
+            prevent();
+            if (!event.repeat) openSearchChats();
+            return;
+        }
+
+        // Ctrl+I => open new chat.
+        if (event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey && lowerKey === 'i') {
+            prevent();
+            if (!event.repeat) openNewChat();
+            return;
+        }
+
+        // Ctrl+J => focus prompt input.
+        if (event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey && lowerKey === 'j') {
+            prevent();
+            if (!event.repeat) focusComposerInput();
+            return;
+        }
+
+        // Alt+L => model picker.
+        if (!event.ctrlKey && event.altKey && !event.shiftKey && !event.metaKey && lowerKey === 'l') {
+            prevent();
+            if (!event.repeat) openModelPicker();
+            return;
+        }
+
+        // Alt+T => tools.
+        if (!event.ctrlKey && event.altKey && !event.shiftKey && !event.metaKey && lowerKey === 't') {
+            prevent();
+            if (!event.repeat) openToolsMenu();
+            return;
+        }
+
+        // Alt+. => plus menu.
+        if (!event.ctrlKey && event.altKey && !event.shiftKey && !event.metaKey && (key === '.' || event.code === 'Period')) {
+            prevent();
+            if (!event.repeat) openPlusMenu();
+            return;
+        }
+
+        // Escape / Alt+I => blur input and focus scroll container.
+        if ((key === 'Escape' && !event.ctrlKey && !event.altKey && !event.shiftKey && !event.metaKey) ||
+            (lowerKey === 'i' && !event.ctrlKey && event.altKey && !event.shiftKey && !event.metaKey)) {
+            if (lowerKey === 'i') {
+                prevent();
             }
-        } else {
+            if (!event.repeat) {
+                setTimeout(() => blurToScrollableContainer(), 0);
+            }
+            return;
+        }
+
+        if (event.metaKey) return;
+
+        // Message jumping (Ctrl+Alt+Shift)
+        const isCtrlAltShift = event.ctrlKey && event.altKey && event.shiftKey && !event.metaKey;
+        if (isCtrlAltShift) {
+            if (key === 'ArrowUp') {
+                prevent();
+                scrollToAdjacentMessage(-1);
+                return;
+            }
+            if (key === 'ArrowDown') {
+                prevent();
+                scrollToAdjacentMessage(1);
+                return;
+            }
+        }
+
+        // Scrolling (Ctrl+Alt)
+        const isCtrlAlt = event.ctrlKey && event.altKey && !event.shiftKey && !event.metaKey;
+        if (isCtrlAlt) {
             switch (key) {
-                case 'ArrowUp': preventDefault(); scrollToAdjacentMessage(-1); return;
-                case 'ArrowDown': preventDefault(); scrollToAdjacentMessage(1); return;
+                case 'ArrowUp': prevent(); scrollByLines(-1); return;
+                case 'ArrowDown': prevent(); scrollByLines(1); return;
+                case 'PageUp': prevent(); scrollByPage(-1); return;
+                case 'PageDown': prevent(); scrollByPage(1); return;
+                case 'Home': prevent(); scrollToTop(); return;
+                case 'End': prevent(); scrollToBottom(); return;
+            }
+        }
+
+        // Don't steal plain/navigation shortcuts while user is typing in an editable field.
+        if (isTyping()) return;
+
+        // If the scroll container has focus, let plain PageUp/PageDown/Home/End also drive chat scrolling.
+        const active = document.activeElement;
+        const scroller = getScrollableContainer();
+        const plainPaging = !event.ctrlKey && !event.altKey && !event.shiftKey && !event.metaKey;
+        const activeIsScroller = active && scroller && active === scroller;
+
+        if (plainPaging && activeIsScroller) {
+            switch (key) {
+                case 'PageUp': prevent(); scrollByPage(-1); return;
+                case 'PageDown': prevent(); scrollByPage(1); return;
+                case 'Home': prevent(); scrollToTop(); return;
+                case 'End': prevent(); scrollToBottom(); return;
             }
         }
     }
 
     document.addEventListener('keydown', handleKeydown, true);
-    console.log("gemini.user.js");
 })();
