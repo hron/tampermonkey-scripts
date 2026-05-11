@@ -207,32 +207,4 @@
     }
 
     document.addEventListener("keydown", handleKeydown, true);
-
-    // function focusSearchWhenReady() {
-    //     const searchElement = document.querySelector('input[type="search"]');
-    //     console.log(searchElement);
-    //     if (searchElement) {
-    //         searchElement.focus();
-    //         return;
-    //     }
-
-    //     const observer = new MutationObserver(() => {
-    //         const input = document.querySelector('input[type="search"]');
-    //         console.log(input);
-    //         if (input) {
-    //             input.focus();
-    //             observer.disconnect();
-    //         }
-    //     });
-
-    //     observer.observe(document.body, {
-    //         childList: true,
-    //         subtree: true,
-    //     });
-    // }
-
-    // console.log(document.location.pathname);
-    // if (document.location.pathname === "/library") {
-    //     focusSearchWhenReady();
-    // }
 })();
